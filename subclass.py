@@ -71,6 +71,16 @@ class Int4Tensor(Tensor):
             x: Int4Tensor = args[0]
             return Int4Tensor(x.int4_data, x.scales)
 
+        elif func is aten._to_copy.default:
+            x: Int4Tensor = args[0]
+            dtype = kwargs.get("dtype", None)
+            device = kwargs.get("device", None)
+            # ignore layout kwarg
+            return Int4Tensor(
+                x.int4_data.to(device=device),
+                x.scales.to(dtype=dtype, device=device),
+            )
+
         msg = f"{cls.__name__} dispatch: {func} is not implemented"
         for i, arg in enumerate(args):
             msg += f"\n- args[{i}]={arg}"
