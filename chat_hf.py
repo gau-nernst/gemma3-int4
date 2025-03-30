@@ -2,11 +2,11 @@ import argparse
 
 import torch
 from safetensors.torch import load_file
-from torch import Tensor, nn
+from torch import nn
 from transformers import AutoTokenizer, Gemma3ForCausalLM, Gemma3TextConfig, TextStreamer, pipeline
 from transformers.modeling_utils import _get_resolved_checkpoint_files
 
-from subclass import from_plain
+import subclass
 
 
 def create_new_init(old_init):
@@ -25,9 +25,8 @@ def main():
     nn.Linear.__init__ = create_new_init(nn.Linear.__init__)
     nn.Embedding.__init__ = create_new_init(nn.Embedding.__init__)
 
-    cfg = Gemma3TextConfig.from_pretrained(args.model)
+    cfg: Gemma3TextConfig = Gemma3TextConfig.from_pretrained(args.model)
     model = Gemma3ForCausalLM(cfg)
-    Gemma3ForCausalLM.from_pretrained
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
     ckpts, _ = _get_resolved_checkpoint_files(
@@ -38,11 +37,13 @@ def main():
         print(f"Load checkpoint {ckpt_path}")
         state_dict.update(load_file(ckpt_path))
 
-    state_dict = from_plain(state_dict)
+    state_dict = subclass.from_plain(state_dict)
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False, assign=True)
     assert len(missing_keys) == 1 and missing_keys[0] == "lm_head.weight"
     assert len(unexpected_keys) == 0
     model.tie_weights()
+
+    subclass._dequantize = torch.compile(subclass._dequantize)
 
     device = "cuda"
     model.to(device).eval()

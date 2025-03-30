@@ -9,7 +9,7 @@ No established libraries (in PyTorch) can take full advantage of the above. Henc
 Plan:
 - HF / vLLM / SGLang integration
 
-```
+```bash
 # convert checkpoint
 uv run convert_flax.py --ckpt_dir gemma3-1b-it-int4 --save_dir gemma-3-1b-it-int4
 

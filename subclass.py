@@ -42,9 +42,6 @@ class Int4Tensor(Tensor):
         fields_str = ", ".join(f"{k}={v}" for k, v in fields.items())
         return f"{self.__class__.__name__}({fields_str})"
 
-    def dequantize(self):
-        return _dequantize(self.int4_data, self.scales)
-
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or dict()
@@ -53,12 +50,12 @@ class Int4Tensor(Tensor):
             x: Tensor = args[0]
             w: Int4Tensor = args[1]
             b: Tensor | None = args[2] if len(args) > 2 else None
-            return F.linear(x, w.dequantize(), b)
+            return F.linear(x, _dequantize(w.int4_data, w.scales), b)
 
         elif func is F.embedding:
             input: Tensor = args[0]
-            weight: Int4Tensor = args[1]
-            return _dequantize(F.embedding(input, weight.int4_data), F.embedding(input, weight.scales))
+            w: Int4Tensor = args[1]
+            return _dequantize(F.embedding(input, w.int4_data), F.embedding(input, w.scales))
 
         with torch._C.DisableTorchFunctionSubclass():
             return func(*args, **kwargs)
