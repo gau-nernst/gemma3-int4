@@ -59,7 +59,12 @@ def find_scales(w: np.ndarray, dim: int):
     ok, _ = check_groups(w, scales, dim + 1)
     assert ok.all()
 
-    return scales.squeeze(dim + 1)
+    inv_scales = 1 / scales.clip(1e-12)
+    qweight = np.round(w * inv_scales)
+    assert qweight.max() <= 7
+    assert qweight.min() >= -8
+
+    return scales.squeeze(dim + 1), qweight
 
 
 def convert_siglip(params, num_layers: int):
@@ -213,14 +218,10 @@ def convert_int4(state_dict: dict[str, np.ndarray]):
 
         assert v.ndim == 2
         N, K = v.shape
-        scales = find_scales(v, dim=1)  # (N, K/32)
-        inv_scale = 1 / scales.clip(1e-12)
-        qweight = np.round(v.reshape(N, K // 32, 32) * inv_scale[..., None])
-        assert qweight.max() <= 7
-        assert qweight.min() >= -8
+        scales, qweight = find_scales(v, dim=1)  # (N, K/32) and (N, K/32, 32)
 
         qweight_i8 = qweight.astype(np.int8)
-        qweight_i4 = (qweight_i8[..., 0::2] & 0xF) | qweight_i8[..., 1::2] << 4
+        qweight_i4 = (qweight_i8[..., 0::2] & 0xF) | (qweight_i8[..., 1::2] << 4)
 
         int4_state_dict[f"{k}.int4_data"] = qweight_i4.reshape(N, K // 2)
         int4_state_dict[f"{k}.scales"] = scales.astype(jnp.bfloat16)
@@ -228,13 +229,118 @@ def convert_int4(state_dict: dict[str, np.ndarray]):
     return int4_state_dict
 
 
+def convert_awq(state_dict: dict[str, np.ndarray]):
+    awq_state_dict = dict()
+
+    for k, v in state_dict.items():
+        if (
+            k.endswith("model.embed_tokens.weight")  # AWQ doesn't support INT4 embeddings
+            or k.startswith(("vision_tower", "multi_modal_projector"))  # vision tower is not quantized
+            or v.ndim == 1
+        ):
+            awq_state_dict[k] = v.astype(jnp.bfloat16)
+            continue
+
+        assert v.ndim == 2
+        v = v.T  # AWQ transpose the weight
+
+        K, N = v.shape
+        scales, qweight = find_scales(v, dim=0)  # (K/32, N) and (K/32, 32, N)
+
+        # AWQ is actually UINT4 (instead of INT4)
+        # hence, we will shift qweight up by 8 (even though Google AQT only uses [-7,7])
+        # and set zero_point = 8
+        qweight = (qweight + 8).astype(np.uint32)
+
+        # AWQ pack 8 int4 into UINT32 in the following layout (from high bits to low bits)
+        # [7 5 3 1 6 4 2 0] along the 2nd dim
+        qweight = qweight.reshape(K, N // 8, 8)
+        qweight_packed = (
+            (qweight[..., 7] << (7 * 4))
+            | (qweight[..., 5] << (6 * 4))
+            | (qweight[..., 3] << (5 * 4))
+            | (qweight[..., 1] << (4 * 4))
+            | (qweight[..., 6] << (3 * 4))
+            | (qweight[..., 4] << (2 * 4))
+            | (qweight[..., 2] << (1 * 4))
+            | (qweight[..., 0] << (0 * 4))
+        )
+        qweight_packed = qweight_packed.view(np.int32).reshape(K, N // 8)
+
+        prefix = k.removesuffix(".weight")
+        awq_state_dict[f"{prefix}.qweight"] = qweight_packed
+        awq_state_dict[f"{prefix}.qzeros"] = np.full((K // 32, N // 8), 0x8888_8888, dtype=np.uint32).view(np.int32)
+        awq_state_dict[f"{prefix}.scales"] = scales.astype(jnp.bfloat16)
+
+    return awq_state_dict
+
+
+def convert_gguf(state_dict: dict[str, np.ndarray]):
+    def map_key(k: str):
+        k = k.replace("model.embed_tokens.", "token_embd.")
+        k = k.replace("model.layers.", "blk.")
+        k = k.replace(".input_layernorm.", ".attn_norm.")
+        k = k.replace(".self_attn.q_norm.", ".attn_q_norm.")
+        k = k.replace(".self_attn.k_norm.", ".attn_k_norm.")
+        k = k.replace(".self_attn.q_proj.", ".attn_q.")
+        k = k.replace(".self_attn.k_proj.", ".attn_k.")
+        k = k.replace(".self_attn.v_proj.", ".attn_v.")
+        k = k.replace(".self_attn.o_proj.", ".attn_output.")
+        k = k.replace(".post_attention_layernorm.", ".post_attention_norm.")
+        k = k.replace(".pre_feedforward_layernorm.", ".ffn_norm.")
+        k = k.replace(".mlp.up_proj.", ".ffn_up.")
+        k = k.replace(".mlp.gate_proj.", ".ffn_gate.")
+        k = k.replace(".mlp.down_proj.", ".ffn_down.")
+        k = k.replace(".post_feedforward_layernorm.", ".post_ffw_norm.")
+        k = k.replace("model.norm.", "output_norm.")
+        return k
+
+    gguf_state_dict = dict()
+
+    for k, v in state_dict.items():
+        # skip vision tower
+        if k.startswith(("vision_tower", "multi_modal_projector")):
+            continue
+
+        k = map_key(k.removeprefix("language_model."))
+
+        if k == "token_embd.weight" and v.shape[1] > 1152:
+            v = v[:-64]  # remove HF strange padding
+
+        if v.ndim == 1:
+            v = v.astype(np.float32)  # GGUF use FP32 for bias and norm weight/bias
+            gguf_state_dict[k] = v + 1 if k.endswith("norm.weight") else v
+            continue
+
+        assert v.ndim == 2
+        N, K = v.shape
+        scales, qweight = find_scales(v, dim=1)  # (N, K/32, 1) and (N, K/32, 32)
+
+        # Q4_0
+        # https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-quants.c
+        qweight_u8 = (qweight + 8).astype(np.uint8)  # shift [-8,7] to [0,15]
+        qweight_u4 = qweight_u8[..., :16] | (qweight_u8[..., 16:] << 4)  # (N, K/32, 16)
+
+        scales_f16 = scales[..., None].astype(np.float16).view(np.uint8)
+        data = np.concatenate([scales_f16, qweight_u4], axis=-1)  # (N, K/32, 2 + 16)
+        gguf_state_dict[k] = data.reshape(N, K // 32 * (2 + 16))
+
+    return gguf_state_dict
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt_dir", required=True, type=Path)
     parser.add_argument("--save_dir", required=True, type=Path)
+    parser.add_argument("--format", required=True)
     args = parser.parse_args()
 
     args.save_dir.mkdir(parents=True, exist_ok=True)
+    converter = dict(
+        int4=convert_int4,
+        awq=convert_awq,
+        gguf=convert_gguf,
+    )[args.format]
 
     total_size = 0
     weight_map = dict()
@@ -244,7 +350,7 @@ if __name__ == "__main__":
     shard_idx = 0
     filename = f"model-{shard_idx + 1:05d}.safetensors"
     for sub_state_dict in tqdm(convert_to_hf(args.ckpt_dir)):
-        sub_state_dict = convert_int4(sub_state_dict)
+        sub_state_dict = converter(sub_state_dict)
         new_size = sum(v.nbytes for v in sub_state_dict.values())
 
         if size + new_size > 5e9:
