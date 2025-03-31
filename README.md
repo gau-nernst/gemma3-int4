@@ -23,7 +23,10 @@ For GGUF, you will need a "donor" GGUF to copy the tokenizer over (I'm too lazy 
 python convert_hf_to_gguf.py $(huggingface-cli download google/gemma-3-4b-it) --outtype bf16 --outfile gemma-3-4b-it-BF16.gguf
 
 # combine weights from convert_flax.py and metadata from convert_hf_to_gguf.py
-python convert_gguf.py --ckpt gemma-3-4b-it-int4-gguf/model.safetensors --metadata gemma-3-4b-it-BF16.gguf --save_path gemma-3-4b-it-q4_0.gguf
+uv run convert_gguf.py --ckpt gemma-3-4b-it-int4-gguf/model.safetensors --metadata gemma-3-4b-it-BF16.gguf --save_path gemma-3-4b-it-q4_0.gguf
+
+# convert vision tower for vision-enabled checkpoints
+python examples/llava/gemma3_convert_encoder_to_gguf.py $(huggingface-cli download google/gemma-3-4b-it) --outtype bf16 --outfile mmproj-bf16.gguf
 ```
 
 Chat demo

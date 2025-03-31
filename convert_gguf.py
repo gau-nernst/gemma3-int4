@@ -1,3 +1,11 @@
+# /// script
+# dependencies = [
+#   "torch",
+#   "numpy",
+#   "safetensors",
+# ]
+# ///
+
 import argparse
 import struct
 import typing
